@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import date
 from decimal import Decimal, InvalidOperation, localcontext
 from fractions import Fraction
@@ -170,11 +171,28 @@ def _side_coef_map(
 
 # ------------------------------------------------------------ 解析失败处理
 def _text_signature(reactant_texts: list[str], product_texts: list[str]) -> str:
-    """解析失败时的退化幂等键：压缩空白后排序。"""
-    def norm(texts: list[str]) -> list[str]:
-        return sorted("".join(t.split()) for t in texts)
+    """解析 / 去重失败时的幂等签名：逐字保留每侧原始文本与提交顺序。
 
-    return f"raw:r={norm(reactant_texts)!r};p={norm(product_texts)!r}"
+    失败记录的缓存键必须能区分语法差异，不做任何等价归一化（不压缩内部
+    空白、不排序、不映射到组成键）：``H 2``（下标前有空格，解析失败，
+    400）与 ``H2``（合法，但同侧重复时是 409）是不同的请求，错误类型与
+    明细都不同，绝不能共用一条记录。提交顺序同样保留——解析按顺序报
+    第一个错误，``["Xx", "Zz"]`` 与 ``["Zz", "Xx"]`` 报出的非法物种
+    不同，``["H2", "O2", "O2", "H2"]`` 与 ``["H2", "H2", "O2", "O2"]``
+    报出的重复物种也不同。因此只有完全相同的失败请求才命中同一条记录、
+    复用同一个 ``reaction_id``，且命中时缓存的错误码与明细即为当前请求
+    应有的结果。首尾空白与解析器一致地忽略（解析前先 ``strip``，错误
+    定位也基于去空白文本，两种写法的错误完全相同）。前缀 ``raw2:`` 与
+    组成键签名（``{...}``）及早期压缩空白的 ``raw:`` 退化格式都不相交，
+    升级前写入的旧记录不会被新请求误命中，仍可按旧 ``reaction_id`` 查询。
+    """
+    payload = {
+        "r": [text.strip() for text in reactant_texts],
+        "p": [text.strip() for text in product_texts],
+    }
+    return "raw2:" + json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
 
 
 def _record_parse_error(
@@ -420,7 +438,7 @@ def process_variants(
     try:
         reactants, products = _parse_all(reactant_texts, product_texts)
     except BalanceError as exc:
-        # 解析 / 去重阶段失败：沿用与 /balance 一致的退化签名生成 ID
+        # 解析 / 去重阶段失败：沿用与 /balance 一致的失败签名生成 ID
         reaction_id = reaction_id_for(
             _text_signature(reactant_texts, product_texts)
         )

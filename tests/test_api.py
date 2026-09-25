@@ -181,6 +181,99 @@ def test_duplicate_species_conflict():
     assert resp.json()["error"]["code"] == "DUPLICATE_SPECIES"
 
 
+def test_parse_error_and_duplicate_species_cached_separately():
+    """失败签名必须区分语法差异：先提交含内部空格的解析失败请求，
+    再提交同侧重复物种请求，后者不得误命中前者的 400 记录。"""
+    parse_error_payload = {"reactants": ["H 2", "H2"], "products": ["H2"]}
+    duplicate_payload = {"reactants": ["H2", "H2"], "products": ["H2"]}
+
+    r1 = client.post("/api/v1/balance", json=parse_error_payload)
+    assert r1.status_code == 400
+    d1 = r1.json()
+    assert d1["error"]["code"] == "FORMULA_PARSE_ERROR"
+    assert d1["cached"] is False
+
+    # 关键回归断言：同侧重复物种应报 409，而不是命中上面的 400 记录
+    r2 = client.post("/api/v1/balance", json=duplicate_payload)
+    assert r2.status_code == 409
+    d2 = r2.json()
+    assert d2["error"]["code"] == "DUPLICATE_SPECIES"
+    assert d2["error"]["details"]["species"] == "H2"
+    assert d2["cached"] is False
+    assert d2["reaction_id"] != d1["reaction_id"]
+
+    # 完全相同的失败请求重复提交：各自复用同一 reaction_id 与错误明细
+    r1b = client.post("/api/v1/balance", json=parse_error_payload)
+    assert r1b.status_code == 400
+    assert r1b.json()["reaction_id"] == d1["reaction_id"]
+    assert r1b.json()["cached"] is True
+    assert r1b.json()["error"] == d1["error"]
+
+    r2b = client.post("/api/v1/balance", json=duplicate_payload)
+    assert r2b.status_code == 409
+    assert r2b.json()["reaction_id"] == d2["reaction_id"]
+    assert r2b.json()["cached"] is True
+    assert r2b.json()["error"] == d2["error"]
+
+    # GET 查询：两条错误记录各自保持各自的结果与状态码
+    g1 = client.get(f"/api/v1/reactions/{d1['reaction_id']}")
+    assert g1.status_code == 400
+    assert g1.json()["error"]["code"] == "FORMULA_PARSE_ERROR"
+    assert g1.json()["reaction_id"] == d1["reaction_id"]
+    g2 = client.get(f"/api/v1/reactions/{d2['reaction_id']}")
+    assert g2.status_code == 409
+    assert g2.json()["error"]["code"] == "DUPLICATE_SPECIES"
+    assert g2.json()["reaction_id"] == d2["reaction_id"]
+
+
+def test_analyze_parse_error_and_duplicate_species_cached_separately():
+    """逐元素分析接口与配平接口共享同一套失败签名，同样不得串记录。"""
+    r1 = client.post(
+        "/api/v1/analyze", json={"reactants": ["N 2", "N2"], "products": ["N2"]}
+    )
+    assert r1.status_code == 400
+    assert r1.json()["error"]["code"] == "FORMULA_PARSE_ERROR"
+
+    r2 = client.post(
+        "/api/v1/analyze", json={"reactants": ["N2", "N2"], "products": ["N2"]}
+    )
+    assert r2.status_code == 409
+    assert r2.json()["error"]["code"] == "DUPLICATE_SPECIES"
+    assert r2.json()["reaction_id"] != r1.json()["reaction_id"]
+
+
+def test_parse_error_signature_preserves_order_and_details():
+    """失败签名保留提交顺序：先报哪个非法物种取决于顺序，不能互相命中。"""
+    r1 = client.post(
+        "/api/v1/balance", json={"reactants": ["Xx", "Zz"], "products": ["H2O"]}
+    )
+    r2 = client.post(
+        "/api/v1/balance", json={"reactants": ["Zz", "Xx"], "products": ["H2O"]}
+    )
+    assert r1.status_code == 400 and r2.status_code == 400
+    d1, d2 = r1.json(), r2.json()
+    assert d1["reaction_id"] != d2["reaction_id"]
+    assert "'Xx'" in d1["error"]["message"]
+    assert "'Zz'" in d2["error"]["message"]
+
+
+def test_duplicate_error_signature_preserves_order_and_details():
+    """同样的多重集、不同的提交顺序：报出的重复物种不同，记录各自独立。"""
+    r1 = client.post(
+        "/api/v1/balance",
+        json={"reactants": ["H2", "O2", "O2", "H2"], "products": ["H2O"]},
+    )
+    r2 = client.post(
+        "/api/v1/balance",
+        json={"reactants": ["H2", "H2", "O2", "O2"], "products": ["H2O"]},
+    )
+    assert r1.status_code == 409 and r2.status_code == 409
+    d1, d2 = r1.json(), r2.json()
+    assert d1["reaction_id"] != d2["reaction_id"]
+    assert d1["error"]["details"]["species"] == "O2"
+    assert d2["error"]["details"]["species"] == "H2"
+
+
 def test_invalid_request_body():
     resp = client.post(
         "/api/v1/balance", json={"reactants": [], "products": ["H2O"]}

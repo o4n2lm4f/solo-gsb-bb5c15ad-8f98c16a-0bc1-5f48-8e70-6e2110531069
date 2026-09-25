@@ -419,3 +419,55 @@ def test_analyze_equivalent_writing_hits_after_reopen(tmp_path, monkeypatch):
     assert body["balanced_ok"] is True
     c2.close()
 
+
+def test_distinct_error_records_keep_results_after_reopen(tmp_path, monkeypatch):
+    """解析失败（400）与重复物种（409）是两条独立记录：SQLite 重启后
+    GET 查询与重复提交都各自保持各自的错误类型、明细与 reaction_id。"""
+    from app import service
+    from fastapi.testclient import TestClient
+    from app.main import app
+
+    db = tmp_path / "errors.db"
+    c1 = ReactionCache(db)
+    monkeypatch.setattr(service, "cache", c1)
+    client = TestClient(app)
+
+    parse_payload = {"reactants": ["H 2", "H2"], "products": ["H2"]}
+    duplicate_payload = {"reactants": ["H2", "H2"], "products": ["H2"]}
+
+    r1 = client.post("/api/v1/balance", json=parse_payload)
+    assert r1.status_code == 400
+    rid1 = r1.json()["reaction_id"]
+    err1 = r1.json()["error"]
+    r2 = client.post("/api/v1/balance", json=duplicate_payload)
+    assert r2.status_code == 409
+    rid2 = r2.json()["reaction_id"]
+    err2 = r2.json()["error"]
+    assert rid1 != rid2
+    c1.close()
+
+    # 模拟容器重启：用同一数据库文件重新打开并挂回 service
+    c2 = ReactionCache(db)
+    monkeypatch.setattr(service, "cache", c2)
+
+    # GET 查询：两条记录各自保持各自的错误码与明细
+    g1 = client.get(f"/api/v1/reactions/{rid1}")
+    assert g1.status_code == 400
+    assert g1.json()["error"] == err1
+    g2 = client.get(f"/api/v1/reactions/{rid2}")
+    assert g2.status_code == 409
+    assert g2.json()["error"] == err2
+
+    # 重启后重复提交完全相同的失败请求：仍各自命中同一 reaction_id
+    again1 = client.post("/api/v1/balance", json=parse_payload)
+    assert again1.status_code == 400
+    assert again1.json()["reaction_id"] == rid1
+    assert again1.json()["cached"] is True
+    assert again1.json()["error"] == err1
+    again2 = client.post("/api/v1/balance", json=duplicate_payload)
+    assert again2.status_code == 409
+    assert again2.json()["reaction_id"] == rid2
+    assert again2.json()["cached"] is True
+    assert again2.json()["error"] == err2
+    c2.close()
+
