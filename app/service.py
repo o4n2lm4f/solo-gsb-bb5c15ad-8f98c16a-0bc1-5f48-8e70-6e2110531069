@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import date
 from decimal import Decimal, InvalidOperation, localcontext
 from fractions import Fraction
@@ -170,11 +171,25 @@ def _side_coef_map(
 
 # ------------------------------------------------------------ 解析失败处理
 def _text_signature(reactant_texts: list[str], product_texts: list[str]) -> str:
-    """解析失败时的退化幂等键：压缩空白后排序。"""
-    def norm(texts: list[str]) -> list[str]:
-        return sorted("".join(t.split()) for t in texts)
+    """解析 / 去重阶段失败时的幂等键：逐字保留原始文本（仅去首尾空白）。
 
-    return f"raw:r={norm(reactant_texts)!r};p={norm(product_texts)!r}"
+    这一阶段的错误（FORMULA_PARSE_ERROR / DUPLICATE_SPECIES）由具体写法
+    决定——``H 2`` 的下标前置空白是语法错误，而 ``H2`` 合法、
+    ``["H2", "H2"]`` 是重复物种——因此签名必须保留语法差异：不压缩内部
+    空白，也不按写法排序（同一批物种书写顺序不同，首先命中的错误可能
+    不同，如 ``["H 2", "Xx"]`` 报下标空白、``["Xx", "H 2"]`` 报未知
+    元素）。首尾空白与解析器一致地忽略（``parse_formula`` 同样先
+    strip，请求模型也已逐条 strip）。完全相同的请求得到完全相同的
+    签名，重复提交命中同一条错误记录；写法不同则落到各自独立的记录，
+    缓存命中时返回的错误类型与明细正是当前请求应有的结果。
+    """
+    payload = {
+        "r": [text.strip() for text in reactant_texts],
+        "p": [text.strip() for text in product_texts],
+    }
+    return "raw:" + json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
 
 
 def _record_parse_error(
@@ -420,7 +435,7 @@ def process_variants(
     try:
         reactants, products = _parse_all(reactant_texts, product_texts)
     except BalanceError as exc:
-        # 解析 / 去重阶段失败：沿用与 /balance 一致的退化签名生成 ID
+        # 解析 / 去重阶段失败：沿用与 /balance 一致的原始文本签名生成 ID
         reaction_id = reaction_id_for(
             _text_signature(reactant_texts, product_texts)
         )

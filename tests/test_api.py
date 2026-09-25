@@ -181,6 +181,108 @@ def test_duplicate_species_conflict():
     assert resp.json()["error"]["code"] == "DUPLICATE_SPECIES"
 
 
+# ------------------------------------------------------------ 错误缓存签名
+def test_error_cache_distinguishes_syntax(monkeypatch):
+    """["H 2","H2"] 的 400 解析错误记录不得被 ["H2","H2"] 误命中：
+    后者应返回 409 重复物种；完全相同的失败请求仍复用同一 reaction_id。"""
+    from app import service
+    from app.cache import ReactionCache
+
+    monkeypatch.setattr(service, "cache", ReactionCache(":memory:"))
+
+    parse_error = {"reactants": ["H 2", "H2"], "products": ["H2"]}
+    r1 = client.post("/api/v1/balance", json=parse_error)
+    assert r1.status_code == 400
+    assert r1.json()["error"]["code"] == "FORMULA_PARSE_ERROR"
+    assert r1.json()["cached"] is False
+
+    # 去掉内部空格后语法合法但同侧重复：必须返回 409，而非误命中上面的 400
+    duplicate = {"reactants": ["H2", "H2"], "products": ["H2"]}
+    r2 = client.post("/api/v1/balance", json=duplicate)
+    assert r2.status_code == 409
+    assert r2.json()["error"]["code"] == "DUPLICATE_SPECIES"
+    assert r2.json()["error"]["details"]["species"] == "H2"
+    assert r2.json()["cached"] is False
+    assert r2.json()["reaction_id"] != r1.json()["reaction_id"]
+
+    # 完全相同的失败请求重复提交：各自命中同一 reaction_id，cached=True
+    r1_again = client.post("/api/v1/balance", json=parse_error)
+    assert r1_again.status_code == 400
+    assert r1_again.json()["reaction_id"] == r1.json()["reaction_id"]
+    assert r1_again.json()["cached"] is True
+    r2_again = client.post("/api/v1/balance", json=duplicate)
+    assert r2_again.status_code == 409
+    assert r2_again.json()["reaction_id"] == r2.json()["reaction_id"]
+    assert r2_again.json()["cached"] is True
+
+    # GET 按 ID 各自取回对应的错误类型与明细
+    g1 = client.get(f"/api/v1/reactions/{r1.json()['reaction_id']}")
+    assert g1.status_code == 400
+    assert g1.json()["error"]["code"] == "FORMULA_PARSE_ERROR"
+    g2 = client.get(f"/api/v1/reactions/{r2.json()['reaction_id']}")
+    assert g2.status_code == 409
+    assert g2.json()["error"]["code"] == "DUPLICATE_SPECIES"
+    assert g2.json()["error"]["details"]["species"] == "H2"
+
+
+def test_analyze_error_cache_distinguishes_syntax(monkeypatch):
+    """/analyze 与 /balance 共用同一套错误缓存签名语义。"""
+    from app import service
+    from app.cache import ReactionCache
+
+    monkeypatch.setattr(service, "cache", ReactionCache(":memory:"))
+
+    r1 = client.post(
+        "/api/v1/analyze", json={"reactants": ["H 2", "H2"], "products": ["H2"]}
+    )
+    assert r1.status_code == 400
+    assert r1.json()["error"]["code"] == "FORMULA_PARSE_ERROR"
+
+    r2 = client.post(
+        "/api/v1/analyze", json={"reactants": ["H2", "H2"], "products": ["H2"]}
+    )
+    assert r2.status_code == 409
+    assert r2.json()["error"]["code"] == "DUPLICATE_SPECIES"
+    assert r2.json()["reaction_id"] != r1.json()["reaction_id"]
+
+    # 同一失败请求在 /balance 与 /analyze 之间共享同一条错误记录
+    r3 = client.post(
+        "/api/v1/balance", json={"reactants": ["H 2", "H2"], "products": ["H2"]}
+    )
+    assert r3.status_code == 400
+    assert r3.json()["reaction_id"] == r1.json()["reaction_id"]
+    assert r3.json()["cached"] is True
+
+
+def test_error_signature_preserves_species_order(monkeypatch):
+    """首先出错的物种不同 -> 错误明细不同 -> 不得共用同一条缓存记录。"""
+    from app import service
+    from app.cache import ReactionCache
+
+    monkeypatch.setattr(service, "cache", ReactionCache(":memory:"))
+
+    r1 = client.post(
+        "/api/v1/balance", json={"reactants": ["H 2", "Xx"], "products": ["H2"]}
+    )
+    r2 = client.post(
+        "/api/v1/balance", json={"reactants": ["Xx", "H 2"], "products": ["H2"]}
+    )
+    assert r1.status_code == r2.status_code == 400
+    m1 = r1.json()["error"]["message"]
+    m2 = r2.json()["error"]["message"]
+    assert "下标前不能有空格" in m1 and "Xx" not in m1
+    assert "Xx" in m2
+    assert r1.json()["reaction_id"] != r2.json()["reaction_id"]
+
+    # 重复提交各自命中各自的记录，错误明细不串
+    r2_again = client.post(
+        "/api/v1/balance", json={"reactants": ["Xx", "H 2"], "products": ["H2"]}
+    )
+    assert r2_again.json()["reaction_id"] == r2.json()["reaction_id"]
+    assert r2_again.json()["error"]["message"] == m2
+    assert r2_again.json()["cached"] is True
+
+
 def test_invalid_request_body():
     resp = client.post(
         "/api/v1/balance", json={"reactants": [], "products": ["H2O"]}

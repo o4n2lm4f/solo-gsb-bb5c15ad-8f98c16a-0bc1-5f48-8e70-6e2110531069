@@ -287,6 +287,58 @@ def test_service_balance_record_recovers_after_reopen(tmp_path, monkeypatch):
     reopened.close()
 
 
+def test_distinct_error_records_survive_reopen(tmp_path, monkeypatch):
+    """语法不同的失败请求各存各的错误记录；SQLite 重启后仍各自保持。
+
+    ["H 2","H2"] 是 400 解析错误，["H2","H2"] 是 409 重复物种：两条记录
+    的签名必须能区分语法差异，重启后 GET 与重复提交都不得互相串扰。
+    """
+    from app import service
+    from fastapi.testclient import TestClient
+    from app.main import app
+
+    db = tmp_path / "errors.db"
+    c1 = ReactionCache(db)
+    monkeypatch.setattr(service, "cache", c1)
+    client = TestClient(app)
+
+    parse_error = {"reactants": ["H 2", "H2"], "products": ["H2"]}
+    r1 = client.post("/api/v1/balance", json=parse_error)
+    assert r1.status_code == 400
+    rid_parse = r1.json()["reaction_id"]
+
+    duplicate = {"reactants": ["H2", "H2"], "products": ["H2"]}
+    r2 = client.post("/api/v1/balance", json=duplicate)
+    assert r2.status_code == 409
+    assert r2.json()["error"]["code"] == "DUPLICATE_SPECIES"
+    rid_dup = r2.json()["reaction_id"]
+    assert rid_parse != rid_dup
+    c1.close()
+
+    c2 = ReactionCache(db)  # 模拟容器重启
+    monkeypatch.setattr(service, "cache", c2)
+
+    # GET 各自取回对应的错误类型与明细
+    g1 = client.get(f"/api/v1/reactions/{rid_parse}")
+    assert g1.status_code == 400
+    assert g1.json()["error"]["code"] == "FORMULA_PARSE_ERROR"
+    g2 = client.get(f"/api/v1/reactions/{rid_dup}")
+    assert g2.status_code == 409
+    assert g2.json()["error"]["code"] == "DUPLICATE_SPECIES"
+    assert g2.json()["error"]["details"]["species"] == "H2"
+
+    # 重启后重复提交仍命中各自记录（同一 reaction_id，cached=True）
+    again = client.post("/api/v1/balance", json=duplicate)
+    assert again.status_code == 409
+    assert again.json()["reaction_id"] == rid_dup
+    assert again.json()["cached"] is True
+    again_parse = client.post("/api/v1/balance", json=parse_error)
+    assert again_parse.status_code == 400
+    assert again_parse.json()["reaction_id"] == rid_parse
+    assert again_parse.json()["cached"] is True
+    c2.close()
+
+
 def _legacy_signature(reactants, products) -> str:
     """签名算法升级前（混入规范化文本）的旧签名构造，用于造旧记录。"""
     def key(sp):
